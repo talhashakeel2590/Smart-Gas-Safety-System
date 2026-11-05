@@ -14,14 +14,13 @@
 
         <TextView
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="47dp"
+            android:layout_marginBottom="24dp"
             android:text="📱 AI-Driven IoT"
             android:textAlignment="center"
             android:textColor="@color/text_main"
-            android:textSize="20sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="24dp"/>
-
+            android:textSize="30sp"
+            android:textStyle="bold" />
         <!-- System Status Card -->
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/cardStatus"
@@ -68,9 +67,10 @@
             app:cardCornerRadius="20dp"
             app:strokeColor="@color/border_color"
             app:strokeWidth="1dp">
+
             <LinearLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
+                android:layout_height="308dp"
                 android:gravity="center"
                 android:orientation="vertical"
                 android:padding="30dp">
@@ -84,9 +84,9 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_gravity="center"
+                        android:max="1000"
                         app:indicatorColor="@color/accent_blue"
                         app:indicatorSize="180dp"
-                        android:max="1000"
                         app:trackColor="@color/border_color"
                         app:trackThickness="12dp" />
 
@@ -96,6 +96,7 @@
                         android:layout_gravity="center"
                         android:gravity="center"
                         android:orientation="vertical">
+
                         <TextView
                             android:id="@+id/tvGasPpm"
                             android:layout_width="wrap_content"
@@ -104,6 +105,7 @@
                             android:textColor="@color/text_main"
                             android:textSize="48sp"
                             android:textStyle="bold" />
+
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
@@ -112,6 +114,43 @@
                             android:textStyle="bold" />
                     </LinearLayout>
                 </FrameLayout>
+
+                <androidx.cardview.widget.CardView
+                    android:id="@+id/cvRiskScore"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="24dp"
+                    app:cardBackgroundColor="@color/border_color"
+                    app:cardCornerRadius="20dp"
+                    app:cardElevation="0dp">
+
+                    <LinearLayout
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingHorizontal="16dp"
+                        android:paddingVertical="8dp">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="sans-serif-medium"
+                            android:text="AI Risk: "
+                            android:textColor="@color/text_main"
+                            android:textSize="14sp" />
+
+                        <TextView
+                            android:id="@+id/tvRiskScore"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="0%"
+                            android:textColor="#34A853"
+                            android:textSize="16sp"
+                            android:textStyle="bold" /> <!-- Starts Green -->
+
+                    </LinearLayout>
+                </androidx.cardview.widget.CardView>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -142,16 +181,17 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical">
+
                     <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
+                        android:layout_width="91dp"
+                        android:layout_height="24dp"
                         android:text="Flame Status"
-                        android:textColor="@color/text_main"/>
+                        android:textColor="@color/text_main" />
                     <TextView
                         android:id="@+id/tvFlameStatus"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="FLAME: CLEAR"
+                        android:text="CLEAR"
                         android:textColor="@color/text_muted"
                         android:textStyle="bold"/>
                 </LinearLayout>
