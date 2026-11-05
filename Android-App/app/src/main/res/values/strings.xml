@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Smart gas safety</string>
+    <string name="title_smart_gas_safety">Smart Gas Safety</string>
+    <string name="gas_level_default">Gas Level: &#8212;</string>
+    <string name="gas_level_format">Gas Level: %1$d PPM</string>
+    <string name="flame_status_clear">Flame Status: Clear</string>
+    <string name="flame_status_detected">Flame Status: DETECTED!</string>
+    <string name="system_status_normal">System Status: Normal</string>
+    <string name="system_status_shutoff_triggered">System Status: SHUTOFF TRIGGERED</string>
+    <string name="system_status_away_mode">System Status: High Sensitivity (Away Mode)</string>
+    <string name="away_mode_label">Away Mode (High Sensitivity)</string>
+    <string name="emergency_shutoff">EMERGENCY SHUTOFF</string>
+</resources>
