@@ -11,25 +11,19 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
-
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
-
 import com.google.android.material.bottomsheet.BottomSheetDialog;
 import com.google.android.material.progressindicator.CircularProgressIndicator;
+import com.google.android.material.slider.Slider;
 import com.google.firebase.database.DataSnapshot;
 import com.google.firebase.database.DatabaseError;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
 import com.google.firebase.database.ValueEventListener;
-
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -39,10 +33,20 @@ public class MainActivity extends AppCompatActivity {
     private com.google.android.material.card.MaterialCardView cardStatus;
     private Button btnEmergencyShutoff, btnResetSystem, btnViewHistory;
 
+    // Servo / Flame Control Slider
+    // Servo angle convention (matches ESP32 firmware): 0 = valve SHUT, 90 = valve OPEN
+    private static final String SERVO_PATH = "Device/servo_angle";
+    private static final int SERVO_SHUT_ANGLE = 0;
+    private static final int SERVO_OPEN_ANGLE = 90;
+    private DatabaseReference servoRef;
+    private Slider sliderServo;
+    private TextView tvServoAngle, tvSliderLock;
+    private boolean isHazardActive = false;   // locks the slider during emergency
+    private boolean isDraggingSlider = false; // stops Firebase updates fighting the user's finger
+
     // AI Tracking Variables
-    private int previousPpm = 0;
-    private int latestPpm = 0;
-    private int latestRisk = 0;
+    private int previousPpm = -1; // -1 = no previous reading yet
+    private int latestPpm,latestRisk = 0;
     private boolean latestFlame = false;
 
     // Anti-Spam Flag for Historical Logging
@@ -65,9 +69,13 @@ public class MainActivity extends AppCompatActivity {
         btnResetSystem = findViewById(R.id.btnResetSystem);
         tvRiskScore = findViewById(R.id.tvRiskScore);
         btnViewHistory = findViewById(R.id.btnViewHistory); // NEW
+        sliderServo = findViewById(R.id.sliderServo);
+        tvServoAngle = findViewById(R.id.tvServoAngle);
+        tvSliderLock = findViewById(R.id.tvSliderLock);
 
         // 2. Initialize Firebase References
         FirebaseDatabase database = FirebaseDatabase.getInstance();
+        servoRef = database.getReference(SERVO_PATH);
         shutoffRef = database.getReference("Device/emergency_shutoff");
         gasRef = database.getReference("Device/gas_value");
         flameRef = database.getReference("Device/flame_status");
@@ -90,8 +98,18 @@ public class MainActivity extends AppCompatActivity {
                     btnEmergencyShutoff.setVisibility(View.GONE);
                     btnResetSystem.setVisibility(View.VISIBLE);
 
+                    // Lock the flame slider and show it at the shut position
+                    isHazardActive = true;
+                    isDraggingSlider = false;
+                    sliderServo.setEnabled(false);
+                    sliderServo.setValue(SERVO_SHUT_ANGLE);
+                    tvServoAngle.setText(SERVO_SHUT_ANGLE + "°");
+                    tvSliderLock.setVisibility(View.VISIBLE);
+
                     if (!hasLoggedCurrentHazard) {
-                        logHazardEvent();
+                        // History is now logged by the ESP32 (works offline too)
+                        // Keep Firebase consistent with the physical knob (already shut by emergency)
+                        servoRef.setValue(SERVO_SHUT_ANGLE);
                         hasLoggedCurrentHazard = true;
                     }
                 } else {
@@ -103,6 +121,11 @@ public class MainActivity extends AppCompatActivity {
 
                     btnEmergencyShutoff.setVisibility(View.VISIBLE);
                     btnResetSystem.setVisibility(View.GONE);
+
+                    // Unlock the flame slider (it stays at the shut position until the user opens it)
+                    isHazardActive = false;
+                    sliderServo.setEnabled(true);
+                    tvSliderLock.setVisibility(View.GONE);
 
                     hasLoggedCurrentHazard = false;
                 }
@@ -163,6 +186,50 @@ public class MainActivity extends AppCompatActivity {
 
         // 8. Handle View History Button (NEW)
         btnViewHistory.setOnClickListener(v -> showHistoryBottomSheet());
+
+        // 9. Flame Control Slider (NEW)
+        setupServoSlider();
+    }
+
+    // --- SERVO SLIDER LOGIC ---
+    @SuppressLint("SetTextI18n")
+    private void setupServoSlider() {
+        // Live label while dragging (UI only - nothing is sent to Firebase yet)
+        sliderServo.addOnChangeListener((slider, value, fromUser) ->
+                tvServoAngle.setText((int) value + "°"));
+
+        // Send the angle once, when the finger is lifted (avoids flooding Firebase / servo jitter)
+        sliderServo.addOnSliderTouchListener(new Slider.OnSliderTouchListener() {
+            @Override
+            public void onStartTrackingTouch(@NonNull Slider slider) {
+                isDraggingSlider = true;
+            }
+
+            @Override
+            public void onStopTrackingTouch(@NonNull Slider slider) {
+                isDraggingSlider = false;
+                if (isHazardActive) return; // never command the knob open during an emergency
+                servoRef.setValue((int) slider.getValue());
+            }
+        });
+
+        // Keep the slider in sync with Firebase (app restart, other devices, ESP updates)
+        servoRef.addValueEventListener(new ValueEventListener() {
+            @Override
+            public void onDataChange(@NonNull DataSnapshot snapshot) {
+                Integer angle = snapshot.getValue(Integer.class);
+                if (angle == null || isDraggingSlider) return;
+
+                int safeAngle = Math.max(SERVO_SHUT_ANGLE, Math.min(SERVO_OPEN_ANGLE, angle));
+                sliderServo.setValue(safeAngle);
+                tvServoAngle.setText(safeAngle + "°");
+            }
+
+            @Override
+            public void onCancelled(@NonNull DatabaseError error) {
+                Log.e("Firebase", "Servo listen failed", error.toException());
+            }
+        });
     }
 
     // --- BOTTOM SHEET UI LOGIC ---
@@ -245,10 +312,10 @@ public class MainActivity extends AppCompatActivity {
         double proximityRisk = (currentPpm / 3500.0) * 100.0;
         if (proximityRisk > 100) proximityRisk = 100;
 
-        int ppmJump = currentPpm - previousPpm;
+        int ppmJump = (previousPpm < 0) ? 0 : currentPpm - previousPpm;
         double velocityRisk = 0;
         if (ppmJump > 0) {
-            velocityRisk = (ppmJump / 300.0) * 100.0;
+            velocityRisk = (ppmJump / 400.0) * 100.0;
             if (velocityRisk > 100) velocityRisk = 100;
         }
 
@@ -266,17 +333,5 @@ public class MainActivity extends AppCompatActivity {
         }
 
         previousPpm = currentPpm;
-    }
-
-    // --- HISTORICAL LOGGING FUNCTION ---
-    private void logHazardEvent() {
-        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date());
-        HashMap<String, Object> logEntry = new HashMap<>();
-        logEntry.put("timestamp", timestamp);
-        logEntry.put("peak_ppm", latestPpm);
-        logEntry.put("risk_score", latestRisk);
-        logEntry.put("flame_detected", latestFlame);
-
-        historyRef.push().setValue(logEntry);
     }
 }

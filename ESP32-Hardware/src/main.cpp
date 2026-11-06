@@ -1,45 +1,185 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <time.h>
 #include <Firebase_ESP_Client.h>
+#include <ESP32Servo.h>
+#include <secrets.h>
 
-// Sensor Pins
+// Pins
 #define BUZZER_PIN 25
 #define GAS_SENSOR_PIN 32
 #define FLAME_SENSOR_PIN 33
-#define RESET_BUTTON_PIN 5 // CHANGED: Now using GPIO 5 for a reliable external button
+#define RESET_BUTTON_PIN 5
+#define SERVO_PIN 26
 
-// Active state for flame sensor (Change to LOW if your module is active-low)
+// Servo convention: 0 = valve SHUT, 90 = valve OPEN
+#define VALVE_SHUT_ANGLE 0
+#define VALVE_OPEN_ANGLE 90
+
+// Active state for flame sensor (Change to HIGH if your module is active-high)
 #define FLAME_DETECTED_STATE LOW
 
 // Wi-Fi & Firebase Credentials
-#define WIFI_SSID "Testing"
-#define WIFI_PASSWORD "12345"
-#define DATABASE_URL "Your_database_url"
-#define API_KEY "Your_key"
-#define USER_EMAIL "tester@testing.com"
-#define USER_PASSWORD "12345"
 
-FirebaseData stream; // Dedicated to listening for shutoff
-FirebaseData fbdo;   // Dedicated to pushing sensor data
+
+// Time zone for log timestamps (Pakistan = UTC+5)
+#define GMT_OFFSET_SEC (5 * 3600)
+
+FirebaseData stream;       // Listens for emergency_shutoff
+FirebaseData servoStream;  // Listens for servo_angle (app slider)
+FirebaseData fbdo;         // Pushes live sensor data
+FirebaseData logFbdo;      // Dedicated to uploading history events
 FirebaseAuth auth;
 FirebaseConfig config;
+Servo gasValveServo;
 
-// State Variables
+// State
 unsigned long lastReadTime = 0;
+unsigned long lastFlushTime = 0;
 int previousGasValue = 0;
+bool firstReading = true;
+volatile bool emergencyActive = false;
+volatile bool emergencyKnown = false;
+volatile bool suppressEvent = false;  // true if we booted into an already-active emergency
+bool fbBegun = false;
+bool streamsReady = false;
 
-// This callback fires INSTANTLY when Firebase changes
+// Latest sensor snapshot (used by the event logger)
+int lastGas = 0;
+int lastRisk = 0;
+bool lastFlame = false;
+
+
+// Helpers used by the event logger (defined below)
+void formatNow(char *buf, size_t n);
+bool cloudOnline();
+struct LogEvent;
+bool pushEventToCloud(const LogEvent &e);
+
+// ==== EVENT LOG BEGIN ====
+// Small offline-safe queue: remembers up to MAX_EVENTS leak events (~30 bytes each)
+// and uploads them to Firebase "History" once Wi-Fi is back.
+#define MAX_EVENTS 5
+
+struct LogEvent {
+  char ts[20];  // "yyyy-MM-dd HH:mm:ss"
+  int peak;
+  int risk;
+  bool flame;
+};
+
+LogEvent events[MAX_EVENTS];
+int eventCount = 0;
+bool eventOpen = false;  // newest event (last in queue) is still in progress
+
+void startEvent(int gas, int risk, bool flame) {
+  if (eventOpen) return;
+  if (eventCount == MAX_EVENTS) {  // queue full -> drop the oldest
+    for (int i = 1; i < MAX_EVENTS; i++) events[i - 1] = events[i];
+    eventCount--;
+  }
+  LogEvent &e = events[eventCount++];
+  formatNow(e.ts, sizeof(e.ts));
+  e.peak = gas;
+  e.risk = risk;
+  e.flame = flame;
+  eventOpen = true;
+}
+
+void updateEvent(int gas, int risk, bool flame) {
+  if (!eventOpen) return;
+  LogEvent &e = events[eventCount - 1];
+  if (gas > e.peak) e.peak = gas;
+  if (risk > e.risk) e.risk = risk;
+  if (flame) e.flame = true;
+}
+
+void endEvent() {
+  eventOpen = false;
+}
+
+// Opens/updates/closes the current event based on the emergency state
+void updateEventState() {
+  if (emergencyActive) {
+    if (!eventOpen && !suppressEvent) startEvent(lastGas, lastRisk, lastFlame);
+    updateEvent(lastGas, lastRisk, lastFlame);
+  } else {
+    suppressEvent = false;
+    endEvent();
+  }
+}
+
+// Uploads at most ONE finished event per call (keeps the main loop responsive)
+void flushEvents() {
+  int closed = eventOpen ? eventCount - 1 : eventCount;
+  if (closed <= 0 || !cloudOnline()) return;
+  if (!pushEventToCloud(events[0])) return;  // keep it and retry later
+  for (int i = 1; i < eventCount; i++) events[i - 1] = events[i];
+  eventCount--;
+}
+// ==== EVENT LOG END ====
+
+void formatNow(char *buf, size_t n) {
+  struct tm t;
+  if (getLocalTime(&t, 100)) {
+    strftime(buf, n, "%Y-%m-%d %H:%M:%S", &t);
+  } else {
+    strncpy(buf, "Time not synced", n - 1);
+    buf[n - 1] = '\0';
+  }
+}
+
+bool cloudOnline() {
+  return fbBegun && WiFi.status() == WL_CONNECTED && Firebase.ready();
+}
+
+
+bool pushEventToCloud(const LogEvent &e) {
+  FirebaseJson json;
+  json.set("timestamp", e.ts);
+  json.set("peak_ppm", e.peak);
+  json.set("risk_score", e.risk);
+  json.set("flame_detected", e.flame);
+  bool ok = Firebase.RTDB.pushJSON(&logFbdo, "History", &json);
+  Serial.println(ok ? "History event uploaded." : "History upload failed, will retry.");
+  return ok;
+}
+
+// Fires instantly when Firebase emergency_shutoff changes
 void streamCallback(FirebaseStream data) {
+  static bool firstStreamEvent = true;
+  emergencyKnown = true;
   if (data.dataType() == "boolean") {
     bool isShutoff = data.boolData();
 
-    if (isShutoff) {
-      Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> BUZZER ON");
-      digitalWrite(BUZZER_PIN, HIGH);
-    } else {
-      Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF");
-      digitalWrite(BUZZER_PIN, LOW);
+    // The first callback only reports the stored value at boot, not a new leak
+    if (firstStreamEvent) {
+      firstStreamEvent = false;
+      if (isShutoff) suppressEvent = true;
     }
+    emergencyActive = isShutoff;
+
+    if (isShutoff) {
+      Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> BUZZER ON & VALVE CLOSED");
+      digitalWrite(BUZZER_PIN, HIGH);
+      gasValveServo.write(VALVE_SHUT_ANGLE);
+    } else {
+      // After a reset the valve STAYS SHUT; the user opens it with the app slider
+      Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF & VALVE STAYS SHUT");
+      digitalWrite(BUZZER_PIN, LOW);
+      gasValveServo.write(VALVE_SHUT_ANGLE);
+    }
+  }
+}
+
+// Fires when the app slider changes servo_angle
+void servoStreamCallback(FirebaseStream data) {
+  if (!emergencyKnown || emergencyActive) return;  // never open the valve during a hazard
+  if (data.dataType() == "int") {
+    int angle = constrain(data.intData(), VALVE_SHUT_ANGLE, VALVE_OPEN_ANGLE);
+    Serial.print("SLIDER -> servo angle: ");
+    Serial.println(angle);
+    gasValveServo.write(angle);
   }
 }
 
@@ -49,99 +189,129 @@ void streamTimeoutCallback(bool timeout) {
   }
 }
 
+void tryStartCloud() {
+  if (streamsReady || WiFi.status() != WL_CONNECTED) return;
+
+  if (!fbBegun) {                       // Stage 1: Wi-Fi is up
+    WiFi.setSleep(false);
+    configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+    fbBegun = true;
+    Serial.println("Wi-Fi up -> starting Firebase...");
+    return;
+  }
+
+  if (!Firebase.ready()) return;        // Stage 2: wait for auth (non-blocking)
+
+  Firebase.RTDB.setInt(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
+  if (Firebase.RTDB.beginStream(&stream, "Device/emergency_shutoff"))
+    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+  if (Firebase.RTDB.beginStream(&servoStream, "Device/servo_angle"))
+    Firebase.RTDB.setStreamCallback(&servoStream, servoStreamCallback, streamTimeoutCallback);
+  streamsReady = true;
+  Serial.println("Cloud ready: streams active.");
+}
+
 void setup() {
   Serial.begin(115200);
+
+  // Servo setup
+  ESP32PWM::allocateTimer(0);
+  gasValveServo.setPeriodHertz(50);
+  gasValveServo.attach(SERVO_PIN, 500, 2400);
+  gasValveServo.write(VALVE_SHUT_ANGLE);  // Always boot with valve SHUT
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(GAS_SENSOR_PIN, INPUT);
   pinMode(FLAME_SENSOR_PIN, INPUT);
-  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP); // Enable internal pull-up for the external button
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
-  // Startup Beep
+  // Startup beep
   digitalWrite(BUZZER_PIN, HIGH);
   delay(300);
   digitalWrite(BUZZER_PIN, LOW);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("\nWi-Fi Connected!");
-
-  WiFi.setSleep(false); // Keep awake for instant stream
-
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-  auth.user.email = USER_EMAIL;
-  auth.user.password = USER_PASSWORD;
-
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
-  Serial.print("Authenticating with Firebase");
-  while (!Firebase.ready()) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("\nFirebase Authenticated successfully!");
-
-  if (!Firebase.RTDB.beginStream(&stream, "Device/emergency_shutoff")) {
-    Serial.print("Stream setup error: ");
-    Serial.println(stream.errorReason());
-  } else {
-    Serial.println("Stream active! Waiting for instant signals...");
-    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
-  }
 }
 
 void loop() {
-  // We use millis() instead of delay() to avoid blocking the instant Firebase stream
-  if (Firebase.ready() && (millis() - lastReadTime >= 1000)) {
+  tryStartCloud();
+  // Sensor + edge logic run every second, independent of Wi-Fi/Firebase
+  if (millis() - lastReadTime >= 1000) {
     lastReadTime = millis();
 
     int currentGas = analogRead(GAS_SENSOR_PIN);
     bool flameDetected = (digitalRead(FLAME_SENSOR_PIN) == FLAME_DETECTED_STATE);
+    bool online = cloudOnline();
 
-    Serial.print("Live Gas Value (with WiFi on): ");
+    Serial.print("Live Gas Value: ");
     Serial.println(currentGas);
 
-    // Send Live Telemetry to Firebase (For Android UI and Cloud AI)
-    Firebase.RTDB.setIntAsync(&fbdo, "Device/gas_value", currentGas);
-    Firebase.RTDB.setBoolAsync(&fbdo, "Device/flame_status", flameDetected);
+    // Risk score (same formula as the Android app: 70% level + 30% spike)
+    float proximity = min(currentGas / 3500.0f, 1.0f) * 100.0f;
+    int jump = firstReading ? 0 : (currentGas - previousGasValue);
+    float velocity = (jump > 0) ? min(jump / 400.0f, 1.0f) * 100.0f : 0.0f;
+    lastRisk = (int)round(proximity * 0.7f + velocity * 0.3f);
+    lastGas = currentGas;
+    lastFlame = flameDetected;
+
+    // Telemetry (only when online)
+    if (online) {
+      Firebase.RTDB.setIntAsync(&fbdo, "Device/gas_value", currentGas);
+      Firebase.RTDB.setBoolAsync(&fbdo, "Device/flame_status", flameDetected);
+    }
 
     // -------------------------------------------------------------
-    // HYBRID EDGE AI & SENSOR LOGIC (Runs even if Android is offline)
+    // HYBRID EDGE AI & SENSOR LOGIC (works even with Wi-Fi down)
     // -------------------------------------------------------------
-    // Adjusted thresholds because ESP32 Wi-Fi shifts the baseline up!
-    bool hardGasLimit = (currentGas >= 3500); 
-    bool gasSpikeBurst = ((currentGas - previousGasValue) >= 400); 
-    
-    // Evaluate logic based on your criteria
+    bool hardGasLimit = (currentGas >= 3500);
+    bool gasSpikeBurst = !firstReading && ((currentGas - previousGasValue) >= 400);
+    firstReading = false;
+
     if (hardGasLimit || gasSpikeBurst || (flameDetected && currentGas >= 3000)) {
-        // TRUE EDGE REFLEX: Turn on buzzer immediately, even if Wi-Fi is down!
-        digitalWrite(BUZZER_PIN, HIGH);
-        
-        // Push 'true' to Firebase to sync the Android App (if online)
+      // Local reflex: buzzer + valve shut immediately
+      digitalWrite(BUZZER_PIN, HIGH);
+      gasValveServo.write(VALVE_SHUT_ANGLE);
+      emergencyActive = true;
+      Serial.println("HAZARD DETECTED! Buzzer ON, Valve CLOSED...");
+
+      // Sync the app (only when online)
+      if (online) {
         Firebase.RTDB.setBoolAsync(&fbdo, "Device/emergency_shutoff", true);
-        Serial.println("HAZARD DETECTED! Buzzer ON...");
+        Firebase.RTDB.setIntAsync(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
+      }
     }
 
     previousGasValue = currentGas;
   }
 
+  // Track the current leak event (start / peak / end)
+  updateEventState();
+
+  // Upload any finished events (one every 3 s while online)
+  if (millis() - lastFlushTime >= 3000) {
+    lastFlushTime = millis();
+    flushEvents();
+  }
+
   // -------------------------------------------------------------
-  // PHYSICAL OFFLINE RESET (Press External Button on GPIO 5)
+  // PHYSICAL OFFLINE RESET (External Button on GPIO 5)
   // -------------------------------------------------------------
   if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-      Serial.println("SYSTEM RESET via Physical Button!");
-      digitalWrite(BUZZER_PIN, LOW); // Turn off local buzzer instantly
-      
-      // Tell the Android app the system is safe again (if Wi-Fi is connected)
-      if (Firebase.ready()) {
-          Firebase.RTDB.setBoolAsync(&fbdo, "Device/emergency_shutoff", false);
-      }
-      delay(1000); // 1-second delay so it doesn't spam from a single press
+    Serial.println("SYSTEM RESET via Physical Button! Valve stays SHUT.");
+    digitalWrite(BUZZER_PIN, LOW);
+    gasValveServo.write(VALVE_SHUT_ANGLE);
+    emergencyActive = false;
+
+    if (cloudOnline()) {
+      Firebase.RTDB.setBoolAsync(&fbdo, "Device/emergency_shutoff", false);
+      Firebase.RTDB.setIntAsync(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
+    }
+    delay(1000);  // Avoid repeat triggers from a single press
   }
 }
