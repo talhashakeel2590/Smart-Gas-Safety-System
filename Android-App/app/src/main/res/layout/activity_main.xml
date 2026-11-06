@@ -21,6 +21,7 @@
             android:textColor="@color/text_main"
             android:textSize="30sp"
             android:textStyle="bold" />
+
         <!-- System Status Card -->
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/cardStatus"
@@ -223,6 +224,21 @@
             android:visibility="gone"
             app:cornerRadius="100dp"
             app:strokeColor="@color/accent_green"
+            app:strokeWidth="1dp" />
+
+        <!-- NEW: View History Button -->
+        <Button
+            android:id="@+id/btnViewHistory"
+            android:layout_width="match_parent"
+            android:layout_height="65dp"
+            android:layout_marginTop="12dp"
+            android:backgroundTint="@color/card_bg"
+            android:text="📜 VIEW LEAK HISTORY"
+            android:textColor="@color/text_main"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            app:cornerRadius="100dp"
+            app:strokeColor="@color/border_color"
             app:strokeWidth="1dp" />
 
     </LinearLayout>

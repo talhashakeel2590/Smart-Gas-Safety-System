@@ -6,7 +6,7 @@
 #define BUZZER_PIN 25
 #define GAS_SENSOR_PIN 32
 #define FLAME_SENSOR_PIN 33
-#define RESET_BUTTON_PIN 0 // The built-in "BOOT" button on the ESP32 board
+#define RESET_BUTTON_PIN 5 // CHANGED: Now using GPIO 5 for a reliable external button
 
 // Active state for flame sensor (Change to LOW if your module is active-low)
 #define FLAME_DETECTED_STATE LOW
@@ -55,7 +55,7 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(GAS_SENSOR_PIN, INPUT);
   pinMode(FLAME_SENSOR_PIN, INPUT);
-  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP); // Enable built-in button
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP); // Enable internal pull-up for the external button
 
   // Startup Beep
   digitalWrite(BUZZER_PIN, HIGH);
@@ -132,10 +132,10 @@ void loop() {
   }
 
   // -------------------------------------------------------------
-  // PHYSICAL OFFLINE RESET (Press BOOT button on ESP32)
+  // PHYSICAL OFFLINE RESET (Press External Button on GPIO 5)
   // -------------------------------------------------------------
   if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-      Serial.println("SYSTEM RESET via Physical BOOT Button!");
+      Serial.println("SYSTEM RESET via Physical Button!");
       digitalWrite(BUZZER_PIN, LOW); // Turn off local buzzer instantly
       
       // Tell the Android app the system is safe again (if Wi-Fi is connected)
