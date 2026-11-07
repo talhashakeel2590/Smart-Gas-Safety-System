@@ -3,13 +3,13 @@
 #include <time.h>
 #include <Firebase_ESP_Client.h>
 #include <ESP32Servo.h>
-#include <secrets.h>
+#include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD, API_KEY, DATABASE_URL, USER_EMAIL, USER_PASSWORD
 
 // Pins
 #define BUZZER_PIN 25
 #define GAS_SENSOR_PIN 32
 #define FLAME_SENSOR_PIN 33
-#define RESET_BUTTON_PIN 5
+#define RESET_BUTTON_PIN 0
 #define SERVO_PIN 26
 
 // Servo convention: 0 = valve SHUT, 90 = valve OPEN
@@ -19,11 +19,11 @@
 // Active state for flame sensor (Change to HIGH if your module is active-high)
 #define FLAME_DETECTED_STATE LOW
 
-// Wi-Fi & Firebase Credentials
-
-
 // Time zone for log timestamps (Pakistan = UTC+5)
 #define GMT_OFFSET_SEC (5 * 3600)
+
+// MQ-5 heater warm-up: no automatic gas shutoff for this long after power-up
+#define WARMUP_MS 20000
 
 FirebaseData stream;       // Listens for emergency_shutoff
 FirebaseData servoStream;  // Listens for servo_angle (app slider)
@@ -33,6 +33,24 @@ FirebaseAuth auth;
 FirebaseConfig config;
 Servo gasValveServo;
 
+// Per-user Firebase paths (set once the ESP32 is logged in)
+String basePath;     // "Devices/<uid>/"
+String historyPath;  // "History/<uid>"
+
+// True during the first WARMUP_MS after boot (stays false afterwards, even if millis() wraps)
+bool warmingUp() {
+  static bool done = false;
+  if (!done && millis() >= WARMUP_MS) done = true;
+  return !done;
+}
+
+// Builds "Devices/<uid>/<leaf>" (uses += because String's + clashes with the Firebase library)
+String devPath(const char *leaf) {
+  String p = basePath;
+  p += leaf;
+  return p;
+}
+
 // State
 unsigned long lastReadTime = 0;
 unsigned long lastFlushTime = 0;
@@ -40,15 +58,18 @@ int previousGasValue = 0;
 bool firstReading = true;
 volatile bool emergencyActive = false;
 volatile bool emergencyKnown = false;
-volatile bool suppressEvent = false;  // true if we booted into an already-active emergency
 bool fbBegun = false;
 bool streamsReady = false;
+
+// Leak flag used for app/admin notifications
+bool leakDetected = false;  // true while the sensors report a leak
+bool leakFlagSent = true;   // what Firebase holds (true = unknown at boot, forces a first sync)
+int lastSentRisk = -1;      // last risk sent to Firebase (-1 = nothing sent yet)
 
 // Latest sensor snapshot (used by the event logger)
 int lastGas = 0;
 int lastRisk = 0;
 bool lastFlame = false;
-
 
 // Helpers used by the event logger (defined below)
 void formatNow(char *buf, size_t n);
@@ -98,13 +119,13 @@ void endEvent() {
   eventOpen = false;
 }
 
-// Opens/updates/closes the current event based on the emergency state
+// Opens/updates/closes the current event. Only leaks detected by the sensors are logged
+// (a manual shutoff from the app is not a leak).
 void updateEventState() {
-  if (emergencyActive) {
-    if (!eventOpen && !suppressEvent) startEvent(lastGas, lastRisk, lastFlame);
+  if (leakDetected) {
+    if (!eventOpen) startEvent(lastGas, lastRisk, lastFlame);
     updateEvent(lastGas, lastRisk, lastFlame);
   } else {
-    suppressEvent = false;
     endEvent();
   }
 }
@@ -130,9 +151,8 @@ void formatNow(char *buf, size_t n) {
 }
 
 bool cloudOnline() {
-  return fbBegun && WiFi.status() == WL_CONNECTED && Firebase.ready();
+  return streamsReady && fbBegun && WiFi.status() == WL_CONNECTED && Firebase.ready();
 }
-
 
 bool pushEventToCloud(const LogEvent &e) {
   FirebaseJson json;
@@ -140,28 +160,21 @@ bool pushEventToCloud(const LogEvent &e) {
   json.set("peak_ppm", e.peak);
   json.set("risk_score", e.risk);
   json.set("flame_detected", e.flame);
-  bool ok = Firebase.RTDB.pushJSON(&logFbdo, "History", &json);
+  bool ok = Firebase.RTDB.pushJSON(&logFbdo, historyPath.c_str(), &json);
   Serial.println(ok ? "History event uploaded." : "History upload failed, will retry.");
   return ok;
 }
 
 // Fires instantly when Firebase emergency_shutoff changes
 void streamCallback(FirebaseStream data) {
-  static bool firstStreamEvent = true;
   emergencyKnown = true;
   if (data.dataType() == "boolean") {
     bool isShutoff = data.boolData();
-
-    // The first callback only reports the stored value at boot, not a new leak
-    if (firstStreamEvent) {
-      firstStreamEvent = false;
-      if (isShutoff) suppressEvent = true;
-    }
     emergencyActive = isShutoff;
 
     if (isShutoff) {
-      Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> BUZZER ON & VALVE CLOSED");
-      digitalWrite(BUZZER_PIN, HIGH);
+      // Valve shuts, but no buzzer here: the buzzer is only for leaks detected by the sensors
+      Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> VALVE CLOSED");
       gasValveServo.write(VALVE_SHUT_ANGLE);
     } else {
       // After a reset the valve STAYS SHUT; the user opens it with the app slider
@@ -174,7 +187,7 @@ void streamCallback(FirebaseStream data) {
 
 // Fires when the app slider changes servo_angle
 void servoStreamCallback(FirebaseStream data) {
-  if (!emergencyKnown || emergencyActive) return;  // never open the valve during a hazard
+  if (!emergencyKnown || emergencyActive || warmingUp()) return;  // never open the valve during a hazard or warm-up
   if (data.dataType() == "int") {
     int angle = constrain(data.intData(), VALVE_SHUT_ANGLE, VALVE_OPEN_ANGLE);
     Serial.print("SLIDER -> servo angle: ");
@@ -189,10 +202,11 @@ void streamTimeoutCallback(bool timeout) {
   }
 }
 
+// Connects to Firebase in the background (never blocks the safety logic)
 void tryStartCloud() {
   if (streamsReady || WiFi.status() != WL_CONNECTED) return;
 
-  if (!fbBegun) {                       // Stage 1: Wi-Fi is up
+  if (!fbBegun) {  // Stage 1: Wi-Fi is up
     WiFi.setSleep(false);
     configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
     config.api_key = API_KEY;
@@ -206,12 +220,21 @@ void tryStartCloud() {
     return;
   }
 
-  if (!Firebase.ready()) return;        // Stage 2: wait for auth (non-blocking)
+  if (!Firebase.ready()) return;             // Stage 2: wait for login (non-blocking)
+  if (auth.token.uid.length() == 0) return;  // wait until the user id is known
 
-  Firebase.RTDB.setInt(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
-  if (Firebase.RTDB.beginStream(&stream, "Device/emergency_shutoff"))
+  // Every user's data lives under their own id
+  String uid = auth.token.uid.c_str();
+  basePath = "Devices/";
+  basePath += uid;
+  basePath += "/";
+  historyPath = "History/";
+  historyPath += uid;
+
+  Firebase.RTDB.setInt(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
+  if (Firebase.RTDB.beginStream(&stream, devPath("emergency_shutoff").c_str()))
     Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
-  if (Firebase.RTDB.beginStream(&servoStream, "Device/servo_angle"))
+  if (Firebase.RTDB.beginStream(&servoStream, devPath("servo_angle").c_str()))
     Firebase.RTDB.setStreamCallback(&servoStream, servoStreamCallback, streamTimeoutCallback);
   streamsReady = true;
   Serial.println("Cloud ready: streams active.");
@@ -236,11 +259,13 @@ void setup() {
   delay(300);
   digitalWrite(BUZZER_PIN, LOW);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);  // no waiting: safety logic starts immediately
 }
 
 void loop() {
   tryStartCloud();
+
   // Sensor + edge logic run every second, independent of Wi-Fi/Firebase
   if (millis() - lastReadTime >= 1000) {
     lastReadTime = millis();
@@ -252,7 +277,7 @@ void loop() {
     Serial.print("Live Gas Value: ");
     Serial.println(currentGas);
 
-    // Risk score (same formula as the Android app: 70% level + 30% spike)
+    // Risk score (70% gas level + 30% spike speed)
     float proximity = min(currentGas / 3500.0f, 1.0f) * 100.0f;
     int jump = firstReading ? 0 : (currentGas - previousGasValue);
     float velocity = (jump > 0) ? min(jump / 400.0f, 1.0f) * 100.0f : 0.0f;
@@ -260,10 +285,21 @@ void loop() {
     lastGas = currentGas;
     lastFlame = flameDetected;
 
+    if (warmingUp()) {
+      lastRisk = 0;  // sensor is still heating up, don't show a false risk
+      Serial.println("Sensor warming up - automatic shutoff paused");
+    }
+
     // Telemetry (only when online)
     if (online) {
-      Firebase.RTDB.setIntAsync(&fbdo, "Device/gas_value", currentGas);
-      Firebase.RTDB.setBoolAsync(&fbdo, "Device/flame_status", flameDetected);
+      Firebase.RTDB.setIntAsync(&fbdo, devPath("gas_value").c_str(), currentGas);
+      Firebase.RTDB.setBoolAsync(&fbdo, devPath("flame_status").c_str(), flameDetected);
+
+      // Risk is sent only when it changes
+      if (lastRisk != lastSentRisk) {
+        Firebase.RTDB.setIntAsync(&fbdo, devPath("risk_score").c_str(), lastRisk);
+        lastSentRisk = lastRisk;
+      }
     }
 
     // -------------------------------------------------------------
@@ -273,25 +309,39 @@ void loop() {
     bool gasSpikeBurst = !firstReading && ((currentGas - previousGasValue) >= 400);
     firstReading = false;
 
-    if (hardGasLimit || gasSpikeBurst || (flameDetected && currentGas >= 3000)) {
+    bool flameAndGas = (flameDetected && currentGas >= 3000);
+
+    if (!warmingUp() && (hardGasLimit || gasSpikeBurst || flameAndGas)) {
       // Local reflex: buzzer + valve shut immediately
       digitalWrite(BUZZER_PIN, HIGH);
       gasValveServo.write(VALVE_SHUT_ANGLE);
       emergencyActive = true;
-      Serial.println("HAZARD DETECTED! Buzzer ON, Valve CLOSED...");
+      leakDetected = true;
+      Serial.print("HAZARD DETECTED (");
+      Serial.print(hardGasLimit ? "gas limit" : gasSpikeBurst ? "gas spike" : "flame + gas");
+      Serial.println(")! Buzzer ON, Valve CLOSED...");
 
       // Sync the app (only when online)
       if (online) {
-        Firebase.RTDB.setBoolAsync(&fbdo, "Device/emergency_shutoff", true);
-        Firebase.RTDB.setIntAsync(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
+        Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), true);
+        Firebase.RTDB.setIntAsync(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
       }
     }
 
     previousGasValue = currentGas;
   }
 
+  // A reset (from the app or the button) clears the leak
+  if (!emergencyActive) leakDetected = false;
+
   // Track the current leak event (start / peak / end)
   updateEventState();
+
+  // Keep the leak flag in Firebase in sync (the app and admin send notifications from it)
+  if (cloudOnline() && leakDetected != leakFlagSent) {
+    Firebase.RTDB.setBoolAsync(&fbdo, devPath("leak_detected").c_str(), leakDetected);
+    leakFlagSent = leakDetected;
+  }
 
   // Upload any finished events (one every 3 s while online)
   if (millis() - lastFlushTime >= 3000) {
@@ -309,8 +359,8 @@ void loop() {
     emergencyActive = false;
 
     if (cloudOnline()) {
-      Firebase.RTDB.setBoolAsync(&fbdo, "Device/emergency_shutoff", false);
-      Firebase.RTDB.setIntAsync(&fbdo, "Device/servo_angle", VALVE_SHUT_ANGLE);
+      Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
+      Firebase.RTDB.setIntAsync(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
     }
     delay(1000);  // Avoid repeat triggers from a single press
   }

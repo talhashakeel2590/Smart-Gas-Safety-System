@@ -71,22 +71,27 @@ public class LoginActivity extends AppCompatActivity {
     }
 
     private void checkUserRole(String uid) {
+        // Save the email so the admin page can list this user
+        String email = mAuth.getCurrentUser().getEmail();
+        FirebaseDatabase.getInstance().getReference("Users").child(uid).child("email").setValue(email);
+
         DatabaseReference roleRef = FirebaseDatabase.getInstance().getReference().child("Users").child(uid).child("role");
 
         roleRef.addListenerForSingleValueEvent(new ValueEventListener() {
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
                 String role = snapshot.getValue(String.class);
+                boolean isAdmin = "admin".equals(role);
 
-                if ("admin".equals(role)) {
+                if (isAdmin) {
                     Toast.makeText(LoginActivity.this, "Admin Authenticated (Monitor Mode)", Toast.LENGTH_SHORT).show();
                 } else {
                     // Defaults to user if role is missing or set to "user"
                     Toast.makeText(LoginActivity.this, "User Authenticated (Control Mode)", Toast.LENGTH_SHORT).show();
                 }
 
-                // Temporarily route everyone to the current MainActivity to verify the login works
-                Intent intent = new Intent(LoginActivity.this, MainActivity.class);
+                // Admins go to the admin page, everyone else to the normal user page
+                Intent intent = new Intent(LoginActivity.this, isAdmin ? AdminActivity.class : MainActivity.class);
                 startActivity(intent);
                 finish();
             }
