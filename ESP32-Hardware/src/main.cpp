@@ -15,6 +15,8 @@
 // Servo convention: 0 = valve SHUT, 90 = valve OPEN
 #define VALVE_SHUT_ANGLE 0
 #define VALVE_OPEN_ANGLE 90
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2400
 
 // Active state for flame sensor (Change to HIGH if your module is active-high)
 #define FLAME_DETECTED_STATE LOW
@@ -25,6 +27,12 @@
 // MQ-5 heater warm-up: no automatic gas shutoff for this long after power-up
 #define WARMUP_MS 20000
 
+// Gas level at which the sensors trigger a shutoff (also blocks releasing the knob)
+#define GAS_HARD_LIMIT 3500
+
+// Physical button: one press = reset (buzzer off, emergency cleared, knob released)
+#define BUTTON_DEBOUNCE_MS 50
+
 FirebaseData stream;       // Listens for emergency_shutoff
 FirebaseData servoStream;  // Listens for servo_angle (app slider)
 FirebaseData fbdo;         // Pushes live sensor data
@@ -32,6 +40,11 @@ FirebaseData logFbdo;      // Dedicated to uploading history events
 FirebaseAuth auth;
 FirebaseConfig config;
 Servo gasValveServo;
+
+// Valve position tracking (so Firebase always shows the real valve angle)
+volatile int valveAngle = VALVE_SHUT_ANGLE;  // last angle the servo was told to go to
+volatile bool servoAttached = true;          // false = knob released (free to turn by hand)
+volatile int servoAngleSent = -1;            // last angle Firebase knows about (-1 = unknown)
 
 // Per-user Firebase paths (set once the ESP32 is logged in)
 String basePath;     // "Devices/<uid>/"
@@ -42,6 +55,22 @@ bool warmingUp() {
   static bool done = false;
   if (!done && millis() >= WARMUP_MS) done = true;
   return !done;
+}
+
+// The ONLY place that moves the valve, so valveAngle is always correct
+void setValve(int angle) {
+  if (!servoAttached) {  // take the knob back if it was released
+    gasValveServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    servoAttached = true;
+  }
+  gasValveServo.write(angle);
+  valveAngle = angle;
+}
+
+// Lets go of the knob so it can be turned by hand (the servo stops holding it)
+void releaseValve() {
+  gasValveServo.detach();
+  servoAttached = false;
 }
 
 // Builds "Devices/<uid>/<leaf>" (uses += because String's + clashes with the Firebase library)
@@ -165,22 +194,34 @@ bool pushEventToCloud(const LogEvent &e) {
   return ok;
 }
 
+// After an emergency the valve is already shut (0), so "back to normal" only lets go of the knob.
+// It stays held if the gas level is still unsafe (or the sensor is still warming up).
+void releaseKnobIfSafe() {
+  if (warmingUp() || lastGas >= GAS_HARD_LIMIT) {
+    Serial.println("Knob stays held: gas level not safe yet.");
+    return;
+  }
+  Serial.println("Knob released - you can turn it by hand or use the slider.");
+  releaseValve();
+}
+
 // Fires instantly when Firebase emergency_shutoff changes
 void streamCallback(FirebaseStream data) {
   emergencyKnown = true;
   if (data.dataType() == "boolean") {
     bool isShutoff = data.boolData();
+    bool wasEmergency = emergencyActive;
     emergencyActive = isShutoff;
 
     if (isShutoff) {
       // Valve shuts, but no buzzer here: the buzzer is only for leaks detected by the sensors
       Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> VALVE CLOSED");
-      gasValveServo.write(VALVE_SHUT_ANGLE);
+      setValve(VALVE_SHUT_ANGLE);
     } else {
-      // After a reset the valve STAYS SHUT; the user opens it with the app slider
-      Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF & VALVE STAYS SHUT");
+      // Only a real reset (emergency -> normal) releases the knob; a first/echo callback must not
+      Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF");
       digitalWrite(BUZZER_PIN, LOW);
-      gasValveServo.write(VALVE_SHUT_ANGLE);
+      if (wasEmergency) releaseKnobIfSafe();
     }
   }
 }
@@ -190,9 +231,11 @@ void servoStreamCallback(FirebaseStream data) {
   if (!emergencyKnown || emergencyActive || warmingUp()) return;  // never open the valve during a hazard or warm-up
   if (data.dataType() == "int") {
     int angle = constrain(data.intData(), VALVE_SHUT_ANGLE, VALVE_OPEN_ANGLE);
+    if (!servoAttached && angle == valveAngle) return;  // knob is released: ignore the same old value
     Serial.print("SLIDER -> servo angle: ");
     Serial.println(angle);
-    gasValveServo.write(angle);
+    setValve(angle);
+    servoAngleSent = angle;  // already in Firebase, no need to write it back
   }
 }
 
@@ -231,7 +274,8 @@ void tryStartCloud() {
   historyPath = "History/";
   historyPath += uid;
 
-  Firebase.RTDB.setInt(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
+  Firebase.RTDB.setInt(&fbdo, devPath("servo_angle").c_str(), valveAngle);
+  servoAngleSent = valveAngle;
   if (Firebase.RTDB.beginStream(&stream, devPath("emergency_shutoff").c_str()))
     Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
   if (Firebase.RTDB.beginStream(&servoStream, devPath("servo_angle").c_str()))
@@ -240,14 +284,40 @@ void tryStartCloud() {
   Serial.println("Cloud ready: streams active.");
 }
 
+// Reset (button): buzzer off, emergency cleared, knob released (same as the app's System Reset)
+void resetSystem() {
+  Serial.println("SYSTEM RESET via Physical Button!");
+  digitalWrite(BUZZER_PIN, LOW);
+  emergencyActive = false;
+  releaseKnobIfSafe();
+  if (cloudOnline()) {
+    Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
+  }
+}
+
+// ==== BUTTON BEGIN ====
+// One press = one reset (ignores contact bounce, and holding the button does not repeat it)
+bool buttonWasPressed = false;
+unsigned long buttonLastLow = 0;  // last time the pin was seen pressed
+
+void handleButton(bool pinPressed, unsigned long now) {
+  if (pinPressed) buttonLastLow = now;
+  // Counts as "still pressed" for a few ms after release, so bounce can't trigger a second reset
+  bool held = pinPressed || (buttonLastLow != 0 && now - buttonLastLow < BUTTON_DEBOUNCE_MS);
+
+  if (held && !buttonWasPressed) resetSystem();  // press just started
+  buttonWasPressed = held;
+}
+// ==== BUTTON END ====
+
 void setup() {
   Serial.begin(115200);
 
   // Servo setup
   ESP32PWM::allocateTimer(0);
   gasValveServo.setPeriodHertz(50);
-  gasValveServo.attach(SERVO_PIN, 500, 2400);
-  gasValveServo.write(VALVE_SHUT_ANGLE);  // Always boot with valve SHUT
+  gasValveServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  setValve(VALVE_SHUT_ANGLE);  // Always boot with valve SHUT
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(GAS_SENSOR_PIN, INPUT);
@@ -301,11 +371,8 @@ void loop() {
         lastSentRisk = lastRisk;
       }
     }
-
-    // -------------------------------------------------------------
-    // HYBRID EDGE AI & SENSOR LOGIC (works even with Wi-Fi down)
-    // -------------------------------------------------------------
-    bool hardGasLimit = (currentGas >= 3500);
+// Edge AI and both sensor logics
+    bool hardGasLimit = (currentGas >= GAS_HARD_LIMIT);
     bool gasSpikeBurst = !firstReading && ((currentGas - previousGasValue) >= 400);
     firstReading = false;
 
@@ -314,7 +381,7 @@ void loop() {
     if (!warmingUp() && (hardGasLimit || gasSpikeBurst || flameAndGas)) {
       // Local reflex: buzzer + valve shut immediately
       digitalWrite(BUZZER_PIN, HIGH);
-      gasValveServo.write(VALVE_SHUT_ANGLE);
+      setValve(VALVE_SHUT_ANGLE);
       emergencyActive = true;
       leakDetected = true;
       Serial.print("HAZARD DETECTED (");
@@ -324,10 +391,8 @@ void loop() {
       // Sync the app (only when online)
       if (online) {
         Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), true);
-        Firebase.RTDB.setIntAsync(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
       }
     }
-
     previousGasValue = currentGas;
   }
 
@@ -342,26 +407,16 @@ void loop() {
     Firebase.RTDB.setBoolAsync(&fbdo, devPath("leak_detected").c_str(), leakDetected);
     leakFlagSent = leakDetected;
   }
-
+  // Keep the valve angle in Firebase in sync (covers opening/closing while Wi-Fi was down)
+  if (cloudOnline() && valveAngle != servoAngleSent) {
+    Firebase.RTDB.setIntAsync(&fbdo, devPath("servo_angle").c_str(), valveAngle);
+    servoAngleSent = valveAngle;
+  }
   // Upload any finished events (one every 3 s while online)
   if (millis() - lastFlushTime >= 3000) {
     lastFlushTime = millis();
     flushEvents();
   }
-
-  // -------------------------------------------------------------
-  // PHYSICAL OFFLINE RESET (External Button on GPIO 5)
-  // -------------------------------------------------------------
-  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-    Serial.println("SYSTEM RESET via Physical Button! Valve stays SHUT.");
-    digitalWrite(BUZZER_PIN, LOW);
-    gasValveServo.write(VALVE_SHUT_ANGLE);
-    emergencyActive = false;
-
-    if (cloudOnline()) {
-      Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
-      Firebase.RTDB.setIntAsync(&fbdo, devPath("servo_angle").c_str(), VALVE_SHUT_ANGLE);
-    }
-    delay(1000);  // Avoid repeat triggers from a single press
-  }
+// Button Reset 
+  handleButton(digitalRead(RESET_BUTTON_PIN) == LOW, millis());
 }
