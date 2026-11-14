@@ -5,9 +5,7 @@ plugins {
 
 android {
     namespace = "com.example.smartgassafety"
-    compileSdk {
-        version = release(37)
-    }
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.example.smartgassafety"
@@ -47,4 +45,5 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation (libs.firebase.auth)
     implementation (libs.firebase.database)
+    implementation(libs.onesignal)
 }

@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <time.h>
+#include <HTTPClient.h>
 #include <Firebase_ESP_Client.h>
 #include <ESP32Servo.h>
 #include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD, API_KEY, DATABASE_URL, USER_EMAIL, USER_PASSWORD
@@ -25,13 +25,17 @@
 #define GMT_OFFSET_SEC (5 * 3600)
 
 // MQ-5 heater warm-up: no automatic gas shutoff for this long after power-up
-#define WARMUP_MS 20000
+#define WARMUP_MS 10000
 
 // Gas level at which the sensors trigger a shutoff (also blocks releasing the knob)
-#define GAS_HARD_LIMIT 3500
+#define GAS_HARD_LIMIT 2000
 
 // Physical button: one press = reset (buzzer off, emergency cleared, knob released)
 #define BUTTON_DEBOUNCE_MS 50
+
+#define GAS_CLEAR_LIMIT 1500    // leak clears only when gas drops below this
+#define MUTE_TIMEOUT_MS 60000   // buzzer snooze length
+#define GAS_SPIKE_THRESHOLD 250 // A 250-count jump in one reading counts as a full "spike" (trigger + 100% velocity)
 
 FirebaseData stream;       // Listens for emergency_shutoff
 FirebaseData servoStream;  // Listens for servo_angle (app slider)
@@ -94,6 +98,9 @@ bool streamsReady = false;
 bool leakDetected = false;  // true while the sensors report a leak
 bool leakFlagSent = true;   // what Firebase holds (true = unknown at boot, forces a first sync)
 int lastSentRisk = -1;      // last risk sent to Firebase (-1 = nothing sent yet)
+bool pushSent = false;      // flag to track if push notification has been sent
+volatile bool buzzerMuted = false;
+volatile unsigned long muteStartTime = 0;
 
 // Latest sensor snapshot (used by the event logger)
 int lastGas = 0;
@@ -183,6 +190,27 @@ bool cloudOnline() {
   return streamsReady && fbBegun && WiFi.status() == WL_CONNECTED && Firebase.ready();
 }
 
+// Sends one OneSignal push to the audience described by targetingJson (filters, etc.)
+void sendOneSignalPush(const String &targetingJson) {
+  HTTPClient http;
+  http.begin("https://onesignal.com/api/v1/notifications");
+  http.addHeader("Content-Type", "application/json; charset=utf-8");
+  String authHeader = "Basic ";
+  authHeader.concat(ONESIGNAL_API_KEY);
+  http.addHeader("Authorization", authHeader);
+
+  String payload = "{\"app_id\":\"";
+  payload += ONESIGNAL_APP_ID;
+  payload += "\",\"headings\":{\"en\":\"⚠️ GAS LEAK DETECTED\"},\"contents\":{\"en\":\"Emergency shutoff activated. Check your gas supply.\"},";
+  payload += targetingJson;
+  payload += "}";
+
+  int code = http.POST(payload);
+  Serial.print(code > 0 ? "Push sent, code: " : "Push failed, code: ");
+  Serial.println(code);
+  http.end();
+}
+
 bool pushEventToCloud(const LogEvent &e) {
   FirebaseJson json;
   json.set("timestamp", e.ts);
@@ -197,8 +225,8 @@ bool pushEventToCloud(const LogEvent &e) {
 // After an emergency the valve is already shut (0), so "back to normal" only lets go of the knob.
 // It stays held if the gas level is still unsafe (or the sensor is still warming up).
 void releaseKnobIfSafe() {
-  if (warmingUp() || lastGas >= GAS_HARD_LIMIT) {
-    Serial.println("Knob stays held: gas level not safe yet.");
+  if (warmingUp()) {
+    Serial.println("Knob stays held: sensor still warming up.");
     return;
   }
   Serial.println("Knob released - you can turn it by hand or use the slider.");
@@ -211,17 +239,32 @@ void streamCallback(FirebaseStream data) {
   if (data.dataType() == "boolean") {
     bool isShutoff = data.boolData();
     bool wasEmergency = emergencyActive;
-    emergencyActive = isShutoff;
 
     if (isShutoff) {
-      // Valve shuts, but no buzzer here: the buzzer is only for leaks detected by the sensors
+      emergencyActive = true;
       Serial.println("STATUS: EMERGENCY SHUTOFF ACTIVE -> VALVE CLOSED");
       setValve(VALVE_SHUT_ANGLE);
     } else {
-      // Only a real reset (emergency -> normal) releases the knob; a first/echo callback must not
-      Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF");
-      digitalWrite(BUZZER_PIN, LOW);
-      if (wasEmergency) releaseKnobIfSafe();
+      if (!wasEmergency) return;  // already normal
+      if (lastGas >= GAS_CLEAR_LIMIT || lastFlame || warmingUp()) {
+        // SMART MUTE: buzzer off, valve stays shut, same leak
+        Serial.println("App reset, but hazard still present! Muting buzzer only.");
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerMuted = true;
+        muteStartTime = millis();
+        emergencyActive = true;
+        if (cloudOnline()) {  // keep the app red/locked
+          Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), true);
+        }
+      } else {
+        // FULL RESET
+        emergencyActive = false;
+        leakDetected = false;
+        buzzerMuted = false;
+        Serial.println("STATUS: SYSTEM NORMAL -> BUZZER OFF");
+        digitalWrite(BUZZER_PIN, LOW);
+        releaseKnobIfSafe();
+      }
     }
   }
 }
@@ -287,11 +330,22 @@ void tryStartCloud() {
 // Reset (button): buzzer off, emergency cleared, knob released (same as the app's System Reset)
 void resetSystem() {
   Serial.println("SYSTEM RESET via Physical Button!");
-  digitalWrite(BUZZER_PIN, LOW);
-  emergencyActive = false;
-  releaseKnobIfSafe();
-  if (cloudOnline()) {
-    Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
+  if (!emergencyActive) return;
+
+  if (lastGas >= GAS_CLEAR_LIMIT || lastFlame || warmingUp()) {
+    Serial.println("Hazard still present! Muting buzzer for 60s. Valve remains closed.");
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerMuted = true;
+    muteStartTime = millis();
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+    emergencyActive = false;
+    leakDetected = false;
+    buzzerMuted = false;
+    releaseKnobIfSafe();
+    if (cloudOnline()) {
+      Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
+    }
   }
 }
 
@@ -348,9 +402,9 @@ void loop() {
     Serial.println(currentGas);
 
     // Risk score (70% gas level + 30% spike speed)
-    float proximity = min(currentGas / 3500.0f, 1.0f) * 100.0f;
+    float proximity = min(currentGas / (float)GAS_HARD_LIMIT, 1.0f) * 100.0f;
     int jump = firstReading ? 0 : (currentGas - previousGasValue);
-    float velocity = (jump > 0) ? min(jump / 400.0f, 1.0f) * 100.0f : 0.0f;
+    float velocity = (jump > 0) ? min(jump / (float)GAS_SPIKE_THRESHOLD, 1.0f) * 100.0f : 0.0f;
     lastRisk = (int)round(proximity * 0.7f + velocity * 0.3f);
     lastGas = currentGas;
     lastFlame = flameDetected;
@@ -373,31 +427,61 @@ void loop() {
     }
 // Edge AI and both sensor logics
     bool hardGasLimit = (currentGas >= GAS_HARD_LIMIT);
-    bool gasSpikeBurst = !firstReading && ((currentGas - previousGasValue) >= 400);
+    bool gasSpikeBurst = (jump >= GAS_SPIKE_THRESHOLD);
     firstReading = false;
 
-    bool flameAndGas = (flameDetected && currentGas >= 3000);
-
-    if (!warmingUp() && (hardGasLimit || gasSpikeBurst || flameAndGas)) {
-      // Local reflex: buzzer + valve shut immediately
+        // 1. Trigger: once per leak (leakDetected stays true until the air clears)
+    if (!warmingUp() && !leakDetected && (hardGasLimit || gasSpikeBurst)) {
       digitalWrite(BUZZER_PIN, HIGH);
       setValve(VALVE_SHUT_ANGLE);
       emergencyActive = true;
       leakDetected = true;
+      buzzerMuted = false;
       Serial.print("HAZARD DETECTED (");
-      Serial.print(hardGasLimit ? "gas limit" : gasSpikeBurst ? "gas spike" : "flame + gas");
+      Serial.print(hardGasLimit ? "gas limit" : "gas spike");
+      if (flameDetected) Serial.print(", flame on");
       Serial.println(")! Buzzer ON, Valve CLOSED...");
+    }
+    // Cloud alerts: once per leak, as soon as we are online
+        // Cloud alerts: once per leak. One POST to the owner's devices + every logged-in admin.
+    if (leakDetected && online && !pushSent) {
+      String tgt = "\"filters\":[{\"field\":\"tag\",\"key\":\"house\",\"relation\":\"=\",\"value\":\"";
+      tgt += auth.token.uid.c_str();
+      tgt += "\"},{\"operator\":\"OR\"},{\"field\":\"tag\",\"key\":\"role\",\"relation\":\"=\",\"value\":\"admin\"}]";
+      sendOneSignalPush(tgt);
+      pushSent = true;
+      Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), true);
+    }
 
-      // Sync the app (only when online)
+    // 2. Snooze expiry: buzzer returns only if the hazard is still there
+    if (leakDetected && buzzerMuted && millis() - muteStartTime >= MUTE_TIMEOUT_MS) {
+      if (currentGas >= GAS_CLEAR_LIMIT || flameDetected) {
+        Serial.println("Mute expired! Hazard still active. Buzzer ON.");
+        digitalWrite(BUZZER_PIN, HIGH);
+        buzzerMuted = false;
+      }
+    }
+
+    // 3. Auto-clear (hysteresis): only for sensor leaks, never for a manual shutoff
+    if (leakDetected && currentGas < GAS_CLEAR_LIMIT && !flameDetected && !gasSpikeBurst) {
+      Serial.println("Air cleared! Auto-returning to normal state.");
+      emergencyActive = false;
+      leakDetected = false;
+      buzzerMuted = false;
+      digitalWrite(BUZZER_PIN, LOW);
+      releaseKnobIfSafe();
       if (online) {
-        Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), true);
+        Firebase.RTDB.setBoolAsync(&fbdo, devPath("emergency_shutoff").c_str(), false);
       }
     }
     previousGasValue = currentGas;
   }
 
   // A reset (from the app or the button) clears the leak
-  if (!emergencyActive) leakDetected = false;
+  if (!emergencyActive) {
+    leakDetected = false;
+    pushSent = false;  // next leak can notify again
+  }
 
   // Track the current leak event (start / peak / end)
   updateEventState();

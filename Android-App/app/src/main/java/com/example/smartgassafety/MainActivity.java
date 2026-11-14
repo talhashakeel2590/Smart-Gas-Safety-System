@@ -8,7 +8,6 @@ import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
-
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -21,28 +20,26 @@ import com.google.firebase.database.DatabaseError;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
 import com.google.firebase.database.ValueEventListener;
+import com.onesignal.OneSignal;
 
 public class MainActivity extends AppCompatActivity {
 
     private TextView tvGasPpm, tvSysStatusText, tvSysStatusDesc, tvFlameStatus, tvRiskScore;
-    private DatabaseReference shutoffRef, gasRef, flameRef, riskRef, leakRef, historyRef;
+    private DatabaseReference shutoffRef, gasRef, flameRef, riskRef, historyRef;
     private CircularProgressIndicator gasGauge;
     private com.google.android.material.card.MaterialCardView cardStatus;
-    private Button btnEmergencyShutoff, btnResetSystem, btnViewHistory;
-
-    // Servo / Flame Control Slider
+    private Button btnEmergencyShutoff, btnResetSystem, btnViewHistory,btnLogout;
+    private ValueEventListener shutoffListener, gasListener, flameListener, riskListener, servoListener;
     // Servo angle convention (matches ESP32 firmware): 0 = valve SHUT, 90 = valve OPEN
     private static final int SERVO_SHUT_ANGLE = 0;
     private static final int SERVO_OPEN_ANGLE = 90;
     private DatabaseReference servoRef;
+    // Servo / Flame Control Slider
     private Slider sliderServo;
     private TextView tvServoAngle, tvSliderLock;
     private boolean isHazardActive = false;   // locks the slider during emergency
     private boolean isDraggingSlider = false; // stops Firebase updates fighting the user's finger
-
-    private int latestPpm = 0;                        // shown in the leak notification
     private boolean hasHandledCurrentHazard = false;  // servo sync runs once per hazard
-    private boolean hasNotifiedLeak = false;          // leak notification is sent once per leak
 
     @SuppressLint("MissingInflatedId")
     @Override
@@ -58,7 +55,9 @@ public class MainActivity extends AppCompatActivity {
         }
 
         setContentView(R.layout.activity_main);
-        NotificationHelper.setup(this);
+        // Initialize OneSignal Push Notifications (OneSignal v5 SDK)
+        OneSignal.initWithContext(this, "489ba8b0-185f-49d8-bc1a-d2a5d87e4e2c");
+        OneSignal.getNotifications().requestPermission(true, com.onesignal.Continue.none());
 
         // 1. Initialize UI Elements
         tvGasPpm = findViewById(R.id.tvGasPpm);
@@ -71,6 +70,7 @@ public class MainActivity extends AppCompatActivity {
         btnResetSystem = findViewById(R.id.btnResetSystem);
         tvRiskScore = findViewById(R.id.tvRiskScore);
         btnViewHistory = findViewById(R.id.btnViewHistory);
+        btnLogout = findViewById(R.id.btnLogout);
         sliderServo = findViewById(R.id.sliderServo);
         tvServoAngle = findViewById(R.id.tvServoAngle);
         tvSliderLock = findViewById(R.id.tvSliderLock);
@@ -82,12 +82,11 @@ public class MainActivity extends AppCompatActivity {
         gasRef = deviceRef.child("gas_value");
         flameRef = deviceRef.child("flame_status");
         riskRef = deviceRef.child("risk_score");
-        leakRef = deviceRef.child("leak_detected");
         servoRef = deviceRef.child("servo_angle");
         historyRef = database.getReference("History").child(user.getUid());
 
         // 3. Monitor Emergency Shutoff State
-        shutoffRef.addValueEventListener(new ValueEventListener() {
+        shutoffListener = new ValueEventListener() {
             @SuppressLint("SetTextI18n")
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
@@ -139,15 +138,15 @@ public class MainActivity extends AppCompatActivity {
             public void onCancelled(@NonNull DatabaseError error) {
                 Log.e("Firebase", "Shutoff listen failed", error.toException());
             }
-        });
+        };
+        shutoffRef.addValueEventListener(shutoffListener);
 
         // 4. Monitor Live Gas PPM
-        gasRef.addValueEventListener(new ValueEventListener() {
+        gasListener = new ValueEventListener() {
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
                 Integer currentPpm = snapshot.getValue(Integer.class);
                 if (currentPpm != null) {
-                    latestPpm = currentPpm;
                     tvGasPpm.setText(String.valueOf(currentPpm));
                     gasGauge.setProgressCompat(currentPpm, true);
                 }
@@ -157,10 +156,11 @@ public class MainActivity extends AppCompatActivity {
             public void onCancelled(@NonNull DatabaseError error) {
                 Log.e("Firebase", "Gas listen failed", error.toException());
             }
-        });
+        };
+        gasRef.addValueEventListener(gasListener);
 
         // 5. Monitor Flame Status
-        flameRef.addValueEventListener(new ValueEventListener() {
+        flameListener = new ValueEventListener() {
             @SuppressLint("SetTextI18n")
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
@@ -180,10 +180,11 @@ public class MainActivity extends AppCompatActivity {
             public void onCancelled(@NonNull DatabaseError error) {
                 Log.e("Firebase", "Flame listen failed", error.toException());
             }
-        });
+        };
+        flameRef.addValueEventListener(flameListener);
 
         // 6. Monitor the AI risk score (calculated on the ESP32)
-        riskRef.addValueEventListener(new ValueEventListener() {
+        riskListener = new ValueEventListener() {
             @SuppressLint("SetTextI18n")
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
@@ -198,35 +199,23 @@ public class MainActivity extends AppCompatActivity {
             public void onCancelled(@NonNull DatabaseError error) {
                 Log.e("Firebase", "Risk listen failed", error.toException());
             }
-        });
+        };
+        riskRef.addValueEventListener(riskListener);
 
-        // 7. Send a notification when the ESP32 reports a leak (once per leak)
-        leakRef.addValueEventListener(new ValueEventListener() {
-            @Override
-            public void onDataChange(@NonNull DataSnapshot snapshot) {
-                Boolean leak = snapshot.getValue(Boolean.class);
-                if (leak != null && leak) {
-                    if (!hasNotifiedLeak) {
-                        NotificationHelper.sendLeakAlert(MainActivity.this, 1,
-                                "Emergency shutoff activated. Gas level: " + latestPpm + " PPM",
-                                MainActivity.class);
-                        hasNotifiedLeak = true;
-                    }
-                } else {
-                    hasNotifiedLeak = false;
-                }
-            }
-
-            @Override
-            public void onCancelled(@NonNull DatabaseError error) {
-                Log.e("Firebase", "Leak listen failed", error.toException());
-            }
-        });
-
-        // 8. Buttons
+        // 7. Buttons
         btnEmergencyShutoff.setOnClickListener(v -> shutoffRef.setValue(true));
         btnResetSystem.setOnClickListener(v -> shutoffRef.setValue(false));
         btnViewHistory.setOnClickListener(v -> HistoryHelper.show(this, historyRef));
+        btnLogout.setOnClickListener(v -> {
+            OneSignal.getUser().removeTag("house");
+            OneSignal.getUser().removeTag("role");
+            OneSignal.logout();
+            FirebaseAuth.getInstance().signOut();
+            Intent intent = new Intent(this, LoginActivity.class);
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(intent);
+            finish();
+        });
 
         // 9. Flame Control Slider
         setupServoSlider();
@@ -255,7 +244,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         // Keep the slider in sync with Firebase (app restart, other devices, ESP updates)
-        servoRef.addValueEventListener(new ValueEventListener() {
+        servoListener = new ValueEventListener() {
             @Override
             public void onDataChange(@NonNull DataSnapshot snapshot) {
                 Integer angle = snapshot.getValue(Integer.class);
@@ -270,6 +259,17 @@ public class MainActivity extends AppCompatActivity {
             public void onCancelled(@NonNull DatabaseError error) {
                 Log.e("Firebase", "Servo listen failed", error.toException());
             }
-        });
+        };
+        servoRef.addValueEventListener(servoListener);
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (shutoffRef != null && shutoffListener != null) shutoffRef.removeEventListener(shutoffListener);
+        if (gasRef != null && gasListener != null) gasRef.removeEventListener(gasListener);
+        if (flameRef != null && flameListener != null) flameRef.removeEventListener(flameListener);
+        if (riskRef != null && riskListener != null) riskRef.removeEventListener(riskListener);
+        if (servoRef != null && servoListener != null) servoRef.removeEventListener(servoListener);
+        super.onDestroy();
     }
 }

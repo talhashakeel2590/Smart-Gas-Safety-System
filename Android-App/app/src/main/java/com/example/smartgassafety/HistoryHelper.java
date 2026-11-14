@@ -73,7 +73,7 @@ public class HistoryHelper {
                     tvLogTime.setText(timestamp != null ? timestamp : "Unknown Time");
                     tvLogRisk.setText(risk + "%");
                     tvLogRisk.setTextColor(RiskUtils.colorFor(risk));
-                    tvLogPpm.setText((peakPpm != null ? peakPpm : 0) + " PPM");
+                    tvLogPpm.setText((peakPpm != null ? peakPpm : 0) + " Gas Value");
 
                     if (flame != null && flame) {
                         tvLogFlame.setVisibility(View.VISIBLE);

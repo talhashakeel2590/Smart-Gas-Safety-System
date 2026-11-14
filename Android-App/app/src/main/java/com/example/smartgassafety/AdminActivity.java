@@ -8,17 +8,21 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.content.Intent;
+import com.google.firebase.auth.FirebaseAuth;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.google.firebase.database.DataSnapshot;
 import com.google.firebase.database.DatabaseError;
+import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
 import com.google.firebase.database.ValueEventListener;
-
-import java.util.HashSet;
-import java.util.Set;
+import com.google.firebase.auth.FirebaseAuth;
+import com.onesignal.OneSignal;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Admin page: shows every user's AI risk and leak history. It never reads gas, flame or valve data. */
 public class AdminActivity extends AppCompatActivity {
@@ -26,20 +30,29 @@ public class AdminActivity extends AppCompatActivity {
     private FirebaseDatabase database;
     private LinearLayout llUsers;
     private TextView tvNoUsers;
-
-    // Users we already sent a leak alert for (so each leak notifies the admin only once)
-    private final Set<String> alertedUsers = new HashSet<>();
+    private final List<DatabaseReference> userRefs = new ArrayList<>();
+    private final List<ValueEventListener> userListeners = new ArrayList<>();
+    private Button btnLogout;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_admin);
-        NotificationHelper.setup(this);
 
         llUsers = findViewById(R.id.llUsers);
         tvNoUsers = findViewById(R.id.tvNoUsers);
         database = FirebaseDatabase.getInstance();
-
+        btnLogout = findViewById(R.id.btnLogout);
+        btnLogout.setOnClickListener(v -> {
+            OneSignal.getUser().removeTag("house");
+            OneSignal.getUser().removeTag("role");
+            OneSignal.logout();
+            FirebaseAuth.getInstance().signOut();
+            Intent intent = new Intent(this, LoginActivity.class);
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            startActivity(intent);
+            finish();
+        });
         loadUsers();
     }
 
@@ -85,49 +98,48 @@ public class AdminActivity extends AppCompatActivity {
                 HistoryHelper.show(this, database.getReference("History").child(uid)));
 
         // Live AI risk score of this user
-        database.getReference("Devices").child(uid).child("risk_score")
-                .addValueEventListener(new ValueEventListener() {
-                    @Override
-                    public void onDataChange(@NonNull DataSnapshot snapshot) {
-                        Integer risk = snapshot.getValue(Integer.class);
-                        if (risk == null) {
-                            tvUserRisk.setText("--");
-                            return;
-                        }
-                        tvUserRisk.setText(risk + "%");
-                        tvUserRisk.setTextColor(RiskUtils.colorFor(risk));
-                    }
+        DatabaseReference riskRef = database.getReference("Devices").child(uid).child("risk_score");
+        ValueEventListener riskListener = new ValueEventListener() {
+            @Override
+            public void onDataChange(@NonNull DataSnapshot snapshot) {
+                Integer risk = snapshot.getValue(Integer.class);
+                if (risk == null) { tvUserRisk.setText("--"); return; }
+                tvUserRisk.setText(risk + "%");
+                tvUserRisk.setTextColor(RiskUtils.colorFor(risk));
+            }
+            @Override
+            public void onCancelled(@NonNull DatabaseError error) {
+                Log.e("Firebase", "Risk listen failed", error.toException());
+            }
+        };
+        riskRef.addValueEventListener(riskListener);
+        userRefs.add(riskRef);
+        userListeners.add(riskListener);
 
-                    @Override
-                    public void onCancelled(@NonNull DatabaseError error) {
-                        Log.e("Firebase", "Risk listen failed", error.toException());
-                    }
-                });
-
-        // Live leak flag of this user -> red badge + one notification per leak
-        database.getReference("Devices").child(uid).child("leak_detected")
-                .addValueEventListener(new ValueEventListener() {
-                    @Override
-                    public void onDataChange(@NonNull DataSnapshot snapshot) {
-                        Boolean leak = snapshot.getValue(Boolean.class);
-                        if (leak != null && leak) {
-                            tvUserLeak.setVisibility(View.VISIBLE);
-                            if (alertedUsers.add(uid)) { // add() is true only the first time
-                                NotificationHelper.sendLeakAlert(AdminActivity.this, uid.hashCode(),
-                                        "Leak detected at " + email, AdminActivity.class);
-                            }
-                        } else {
-                            tvUserLeak.setVisibility(View.GONE);
-                            alertedUsers.remove(uid);
-                        }
-                    }
-
-                    @Override
-                    public void onCancelled(@NonNull DatabaseError error) {
-                        Log.e("Firebase", "Leak listen failed", error.toException());
-                    }
-                });
+        DatabaseReference leakRef = database.getReference("Devices").child(uid).child("leak_detected");
+        ValueEventListener leakListener = new ValueEventListener() {
+            @Override
+            public void onDataChange(@NonNull DataSnapshot snapshot) {
+                Boolean leak = snapshot.getValue(Boolean.class);
+                tvUserLeak.setVisibility((leak != null && leak) ? View.VISIBLE : View.GONE);
+            }
+            @Override
+            public void onCancelled(@NonNull DatabaseError error) {
+                Log.e("Firebase", "Leak listen failed", error.toException());
+            }
+        };
+        leakRef.addValueEventListener(leakListener);
+        userRefs.add(leakRef);
+        userListeners.add(leakListener);
 
         llUsers.addView(card);
+    }
+
+    @Override
+    protected void onDestroy() {
+        for (int i = 0; i < userRefs.size(); i++) {
+            userRefs.get(i).removeEventListener(userListeners.get(i));
+        }
+        super.onDestroy();
     }
 }

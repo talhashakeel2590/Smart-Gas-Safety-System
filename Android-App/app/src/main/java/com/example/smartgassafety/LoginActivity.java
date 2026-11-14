@@ -14,6 +14,7 @@ import com.google.android.material.button.MaterialButton;
 import com.google.android.material.textfield.TextInputEditText;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
+import com.onesignal.OneSignal;
 
 public class LoginActivity extends AppCompatActivity {
     private FirebaseAuth mAuth;
@@ -25,10 +26,23 @@ public class LoginActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_login);
 
-        // Initialize Firebase Auth
+        // 1. Initialize OneSignal FIRST (before any early returns or logins)
+        OneSignal.initWithContext(this, "489ba8b0-185f-49d8-bc1a-d2a5d87e4e2c");
+        OneSignal.getNotifications().requestPermission(true, com.onesignal.Continue.none());
+
+        // 2. Initialize Firebase Auth
         mAuth = FirebaseAuth.getInstance();
+
+        // 3. Auto-login check
+        if (mAuth.getCurrentUser() != null) {
+            checkUserRole(mAuth.getCurrentUser().getUid());
+            return; // Stops here, goes to dashboard
+        }
+
+        // 4. Only logout OneSignal if we are actually showing the login screen
+        OneSignal.logout();
+
         loginProgressBar = findViewById(R.id.loginProgressBar);
-        // Connect UI elements
         etEmail = findViewById(R.id.etEmail);
         etPassword = findViewById(R.id.etPassword);
         btnLogin = findViewById(R.id.btnLogin);
@@ -82,6 +96,13 @@ public class LoginActivity extends AppCompatActivity {
             public void onDataChange(@NonNull DataSnapshot snapshot) {
                 String role = snapshot.getValue(String.class);
                 boolean isAdmin = "admin".equals(role);
+                OneSignal.login(uid);
+                OneSignal.getUser().addTag("house", uid);
+                if (isAdmin) {
+                    OneSignal.getUser().addTag("role", "admin");
+                } else {
+                    OneSignal.getUser().removeTag("role");
+                }
 
                 if (isAdmin) {
                     Toast.makeText(LoginActivity.this, "Admin Authenticated (Monitor Mode)", Toast.LENGTH_SHORT).show();

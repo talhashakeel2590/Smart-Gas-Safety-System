@@ -12,6 +12,25 @@
         android:orientation="vertical"
         android:padding="20dp">
 
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnLogout"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="6dp"
+            android:text="Logout"
+            android:textColor="@color/text_main"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            app:backgroundTint="@color/card_bg"
+            app:cornerRadius="100dp"
+            app:strokeColor="@color/border_color"
+            app:strokeWidth="1dp" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="47dp"
@@ -110,7 +129,7 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="PPM"
+                            android:text="Gas Value"
                             android:textColor="@color/text_muted"
                             android:textStyle="bold" />
                     </LinearLayout>
