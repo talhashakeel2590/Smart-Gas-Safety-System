@@ -43,18 +43,18 @@ This repository contains the complete ESP32 firmware and the Android application
 *   Create a OneSignal app and generate a REST API Key.
 
 ### 2. Firmware (ESP32)
-*   Create a `secrets.h` file in the same directory as `main.cpp` with the following credentials:
-    
-    #define WIFI_SSID "your_wifi"
-    #define WIFI_PASSWORD "your_password"
-    #define API_KEY "firebase_web_api_key"
-    #define DATABASE_URL "your_firebase_db_url"
-    #define USER_EMAIL "device_owner_email"
-    #define USER_PASSWORD "device_owner_password"
-    #define ONESIGNAL_API_KEY "your_onesignal_rest_key"
-    #define ONESIGNAL_APP_ID "your_onesignal_app_id"
-
-*   Flash the code to the ESP32.
+* Create a `secrets.h` file in the same directory as `main.cpp` with the following credentials:
+  ```cpp
+  #define WIFI_SSID "your_wifi"
+  #define WIFI_PASSWORD "your_password"
+  #define API_KEY "firebase_web_api_key"
+  #define DATABASE_URL "your_firebase_db_url"
+  #define USER_EMAIL "device_owner_email"
+  #define USER_PASSWORD "device_owner_password"
+  #define ONESIGNAL_API_KEY "your_onesignal_rest_key"
+  #define ONESIGNAL_APP_ID "your_onesignal_app_id"
+  ```
+* Flash the code to the ESP32.
 
 ### 3. Android App
 *   Add your `google-services.json` file to the `app/` directory.
