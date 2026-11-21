@@ -2,7 +2,7 @@
 
 An end-to-end IoT safety solution designed to detect hazardous gas leaks and fires, automatically shut off the gas valve, and provide real-time alerts to homeowners and monitoring admins. 
 
-Built as a Final Year Project (FYP), this repository contains the complete ESP32 firmware and the Android application (Java).
+This repository contains the complete ESP32 firmware and the Android application (Java), built as an end-to-end independent engineering project.
 
 ## ✨ Key Features
 
@@ -64,7 +64,7 @@ Built as a Final Year Project (FYP), this repository contains the complete ESP32
 ## 📸 Project Gallery
 
 ### System Architecture
-<img src="assets/system-architecture.png" alt="System Architecture" width="600"/>
+<img src="assets/app-dataflow-diagram.png" alt="System Architecture" width="600"/>
 
 ### Android Application
 | Login | Dashboard | Emergency State | Admin Dashboard |
@@ -76,4 +76,4 @@ Built as a Final Year Project (FYP), this repository contains the complete ESP32
 The `secrets.h` and `google-services.json` files are intentionally **gitignored** in this repository to prevent credential leaks. If cloning this repository, you must provide your own credentials to compile the firmware or the Android app.
 
 ---
-*Developed for the Final Year Project (FYP) curriculum.*
+*Developed as a full-stack IoT engineering project.*
