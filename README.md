@@ -64,7 +64,7 @@ Built as a Final Year Project (FYP), this repository contains the complete ESP32
 ## 📸 Project Gallery
 
 ### System Architecture
-<img src="assets/system-architecture.png" alt="System Architecture" width="600"/>
+<img src="assets/app-dataflow-diagram.png" alt="System Architecture" width="600"/>
 
 ### Android Application
 | Login | Dashboard | Emergency State | Admin Dashboard |
