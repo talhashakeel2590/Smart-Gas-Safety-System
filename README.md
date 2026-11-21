@@ -61,6 +61,16 @@ Built as a Final Year Project (FYP), this repository contains the complete ESP32
 *   Update the OneSignal App ID in `LoginActivity.java`.
 *   Build and run the project in Android Studio.
 
+## 📸 Project Gallery
+
+### System Architecture
+<img src="assets/system-architecture.png" alt="System Architecture" width="600"/>
+
+### Android Application
+| Login | Dashboard | Emergency State | Admin Dashboard |
+| :---: | :---: | :---: | :---: |
+| <img src="assets/app-login.png" width="200"/> | <img src="assets/app-dashboard.png" width="200"/> | <img src="assets/app-emergency.png" width="200"/> | <img src="assets/app-admin.png" width="200"/> |
+
 ## 🔒 Security Note
 
 The `secrets.h` and `google-services.json` files are intentionally **gitignored** in this repository to prevent credential leaks. If cloning this repository, you must provide your own credentials to compile the firmware or the Android app.
