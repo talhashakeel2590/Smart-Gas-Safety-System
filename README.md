@@ -75,5 +75,8 @@ This repository contains the complete ESP32 firmware and the Android application
 
 The `secrets.h` and `google-services.json` files are intentionally **gitignored** in this repository to prevent credential leaks. If cloning this repository, you must provide your own credentials to compile the firmware or the Android app.
 
+## 🚀 Future Roadmap
+*   **Backend Migration:** Transition from Firebase Realtime Database to a custom Spring Boot (Java) REST API backend with PostgreSQL for enterprise scalability and vendor independence.
+*   **Hardware Integration:** Replace the demo servo valve with an inline solenoid valve for a true commercial gas pipeline.
 ---
 *Developed as a full-stack IoT engineering project.*
